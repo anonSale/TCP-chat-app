@@ -1,67 +1,127 @@
 import socket, threading, json, os
 
-HOST, PORT = "0.0.0.0", int(os.environ.get("CHAT_PORT", 5000))
-clients = {}                 # username -> socket
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("CHAT_PORT", 5000))
+MAX_LINE = 65536                 # longest accepted message line, in characters
+clients = {}                     # username -> socket
 lock = threading.Lock()
 
+
 def send(sock, obj):
-    sock.sendall((json.dumps(obj) + "\n").encode("utf-8"))
+    """Send one JSON line. Returns False (never raises) if the socket is dead."""
+    try:
+        sock.sendall((json.dumps(obj) + "\n").encode("utf-8"))
+        return True
+    except OSError:
+        return False
+
+
+def remove_user(name, sock):
+    with lock:
+        if clients.get(name) is sock:
+            del clients[name]
+
 
 def broadcast(obj, exclude=None):
     with lock:
-        targets = [s for u, s in clients.items() if u != exclude]
-    for s in targets:
-        try: send(s, obj)
-        except OSError: pass
+        targets = [(u, s) for u, s in clients.items() if u != exclude]
+    for name, s in targets:
+        if not send(s, obj):
+            remove_user(name, s)      # drop users whose connection is dead
+
 
 def handle(conn, addr):
     username = None
-    reader = conn.makefile("r", encoding="utf-8")   # splits stream on "\n"
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    reader = conn.makefile("r", encoding="utf-8")
     try:
-        for line in reader:                          # ends when client closes (recv returns b"")
-            try: msg = json.loads(line)
-            except json.JSONDecodeError:
-                send(conn, {"type": "error", "text": "invalid JSON"}); continue
+        while True:
+            line = reader.readline(MAX_LINE)
+            if not line:                       # b"" from recv: client closed (FIN)
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+                if not isinstance(msg, dict):
+                    raise ValueError
+            except ValueError:
+                send(conn, {"type": "error", "text": "invalid JSON"})
+                continue
 
             t = msg.get("type")
-            if username is None:                     # must join first
+
+            # --- must join first ---
+            if username is None:
                 name = str(msg.get("username", "")).strip()
+                if t != "join" or not name or len(name) > 20:
+                    send(conn, {"type": "error", "text": "join with a username (1-20 characters)"})
+                    continue
                 with lock:
-                    ok = t == "join" and name and name not in clients
-                    if ok: clients[name] = conn
-                if not ok:
-                    send(conn, {"type": "error", "text": "join with a unique username"}); continue
+                    taken = name in clients
+                    if not taken:
+                        clients[name] = conn
+                if taken:
+                    send(conn, {"type": "error", "text": "username taken"})
+                    continue
                 username = name
+                print(f"{username} joined from {addr}", flush=True)
                 send(conn, {"type": "system", "text": f"welcome {username}"})
                 broadcast({"type": "system", "text": f"{username} joined"}, exclude=username)
-            elif t == "msg":
-                broadcast({"type": "msg", "from": username, "text": msg.get("text", "")}, exclude=username)
+                continue
+
+            # --- normal messages ---
+            if t == "msg":
+                text = str(msg.get("text", "")).strip()
+                if text:
+                    broadcast({"type": "msg", "from": username, "text": text}, exclude=username)
+
             elif t == "dm":
-                with lock: target = clients.get(msg.get("to"))
-                if target: send(target, {"type": "dm", "from": username, "text": msg.get("text", "")})
-                else: send(conn, {"type": "error", "text": "user not found"})
+                to = msg.get("to")
+                text = str(msg.get("text", "")).strip()
+                if not text:
+                    continue
+                with lock:
+                    target = clients.get(to)
+                if target is None:
+                    send(conn, {"type": "error", "text": f"user '{to}' not found"})
+                elif send(target, {"type": "dm", "from": username, "text": text}):
+                    send(conn, {"type": "dm_sent", "to": to, "text": text})   # confirmation
+                else:
+                    remove_user(to, target)
+                    send(conn, {"type": "error", "text": f"user '{to}' not found"})
+
             elif t == "users":
-                with lock: names = list(clients)
+                with lock:
+                    names = list(clients)
                 send(conn, {"type": "users", "users": names})
-    except (ConnectionResetError, BrokenPipeError, OSError):
-        pass                                         # abrupt disconnect
+            # unknown types are ignored
+    except (OSError, ValueError):
+        pass                                   # reset / abrupt disconnect / bad bytes
     finally:
         if username:
-            with lock: clients.pop(username, None)
+            remove_user(username, conn)
             broadcast({"type": "system", "text": f"{username} left"})
-        conn.close()
-        print(f"closed {addr}")
+            print(f"{username} left", flush=True)
+        try:
+            conn.close()
+        except OSError:
+            pass
+        print(f"closed {addr}", flush=True)
+
 
 def main():
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((HOST, PORT))
     srv.listen()
-    print(f"listening on {HOST}:{PORT}")
+    print(f"listening on {HOST}:{PORT}", flush=True)
     while True:
-        conn, addr = srv.accept()                    # one new socket per client
-        print(f"connected {addr}")
+        conn, addr = srv.accept()              # new socket per client
+        print(f"connected {addr}", flush=True)
         threading.Thread(target=handle, args=(conn, addr), daemon=True).start()
+
 
 if __name__ == "__main__":
     main()
